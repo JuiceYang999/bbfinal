@@ -1,0 +1,15 @@
+{
+  "best_combo_name": "Base",
+  "best_features": [
+    "V1",
+    "V2",
+    "Ratio"
+  ],
+  "best_params": {
+    "n_estimators": 307,
+    "max_depth": 2,
+    "learning_rate": 0.14729963912182545,
+    "subsample": 0.7737181533513842,
+    "reg_alpha": 1.0830833231415746
+  }
+}

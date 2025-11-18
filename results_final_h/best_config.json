@@ -1,0 +1,18 @@
+{
+  "best_combo_name": "Base+3_Log+Energy+Norm",
+  "best_features": [
+    "V1",
+    "V2",
+    "Ratio",
+    "Log_Ratio",
+    "Energy_Sum",
+    "Norm_Diff"
+  ],
+  "best_params": {
+    "n_estimators": 238,
+    "max_depth": 2,
+    "learning_rate": 0.021032468559972498,
+    "subsample": 0.765868330443733,
+    "reg_alpha": 1.0905349428640692e-06
+  }
+}

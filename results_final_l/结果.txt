@@ -1,0 +1,14 @@
+>>> [Stage 3] 多项式比值回归 (论文基线)
+    -> 拟合完成 (deg=3), R2(°C) = 0.335743
+     Poly-Ratio   RMSE = 187.203°C | RMSPE = 19.65%
+     XGB-Optimal  RMSE = 58.359°C | RMSPE =  6.02%
+
+>>> [Stage 8] 低温区间稳定性讨论...
+  -> 阈值 ≤ 560.0°C，占比 31.5%
+     低压均值: V1=0.002, V2=0.001, Ratio CV=0.33
+     Poly-Ratio   RMSE=144.082°C | RMSPE=32.02%
+     XGB-Optimal  RMSE= 4.325°C | RMSPE= 0.90%
+
+>>> 最终测试集指标:
+     Poly-Ratio   RMSE = 127.6103 °C, R2 = 0.46789
+     XGB-Optimal  RMSE = 3.6485 °C, R2 = 0.99957
