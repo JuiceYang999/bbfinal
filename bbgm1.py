@@ -47,11 +47,11 @@ class Config:
     
     # 优化
     OPTUNA_TRIALS = 30  # 全量数据寻优次数
-    OPTUNA_TRIALS_SPARSE = 10 # [新] 稀疏数据寻优次数 (必须更少更快)
+    OPTUNA_TRIALS_SPARSE = 10 # 稀疏数据寻优次数
     N_FOLDS = 3
     ENSEMBLE_MODELS = 5
     
-    # [新] 特征筛选阈值 (与 T_true 的相关性)
+    # 特征筛选阈值 (与 T_true 的相关性)
     FEATURE_CORR_THRESHOLD = 0.95
     
     try:
@@ -171,7 +171,7 @@ class FeatureEngineer:
         return df
 
     def filter_and_get_combinations(self, df_train):
-        """ [新] 启用相关性分析来筛选特征 """
+        """启用相关性分析来筛选特征 """
         print("\n>>> [Stage 2] 特征工程与相关性分析...")
         
         # 1. 计算与 T_true 的皮尔逊相关性
@@ -206,14 +206,38 @@ class FeatureEngineer:
         return combinations
 
 # ==============================================================================
-# 3. 基准模型 (Robust Version)
+# 3. 多项式比值回归 (Polynomial Ratio Calibration)
+# ==============================================================================
+class PolynomialRatioCalibrator:
+    def __init__(self, degree=3):
+        self.degree = degree
+        self.model = None
+
+    def train(self, df):
+        print("\n>>> [Stage 3] 多项式比值回归 (论文基线)")
+        ratios = df['Ratio'].values
+        temps_c = df['T_true'].values
+        coeffs = np.polyfit(ratios, temps_c, self.degree)
+        self.model = np.poly1d(coeffs)
+        preds_c = self.model(ratios)
+        r2 = r2_score(temps_c, preds_c)
+        print(f"    -> 拟合完成 (deg={self.degree}), R2(°C) = {r2:.6f}")
+
+    def predict(self, df):
+        if self.model is None:
+            raise RuntimeError("Polynomial baseline not fitted.")
+        preds_c = self.model(df['Ratio'].values)
+        return pd.Series(preds_c, index=df.index, name='Poly-Ratio')
+
+# ==============================================================================
+# 4. 基准模型 (Robust Version)
 # ==============================================================================
 class BaselineManager:
     def __init__(self):
         self.model = None
 
     def train(self, X, y):
-        print("\n>>> [Stage 3] 训练基准模型 (Ridge Regularized)...")
+        print("\n>>> [Stage 4] 训练基准模型 (Ridge Regularized)")
         self.model = Pipeline([
             ('scaler', StandardScaler()),
             ('poly', PolynomialFeatures(degree=3, include_bias=False)),
@@ -228,7 +252,7 @@ class BaselineManager:
         return pd.Series(preds, index=X.index, name='Ridge-Ratio')
 
 # ==============================================================================
-# 4. XGBoost 优化 (GroupKFold 版)
+# 5. XGBoost 优化 (GroupKFold 版)
 # ==============================================================================
 class XGBoostManager:
     def __init__(self, config):
@@ -388,6 +412,84 @@ def run_efficiency_study(cfg, df_train, df_test, xgbo_manager, best_feats_global
         
     return pd.DataFrame(results)
 
+def run_extrapolation_test(train_df, test_df, best_params, best_feats, cfg):
+    print("\n>>> [Stage 7] 外推测试 (Extrapolation Test)...")
+    combined = pd.concat([train_df, test_df], ignore_index=True)
+    if combined.empty:
+        print("  无可用样本，跳过外推测试。")
+        return
+
+    combined = combined.sort_values('T_true').reset_index(drop=True)
+    temp_min, temp_max = combined['T_true'].min(), combined['T_true'].max()
+    print(f"  当前数据覆盖: {temp_min:.1f}°C ~ {temp_max:.1f}°C (目标 400-1750°C)")
+
+    if combined['T_true'].nunique() < 4:
+        print("  温度点不足以构造外推切分，跳过。")
+        return
+
+    threshold = combined['T_true'].quantile(0.85)
+    if threshold >= temp_max:
+        threshold = combined['T_true'].median()
+
+    train_ext = combined[combined['T_true'] <= threshold]
+    extrap_set = combined[combined['T_true'] > threshold]
+
+    if train_ext.empty or extrap_set.empty:
+        print("  高温段样本不足，无法评估外推性。")
+        return
+
+    print(f"  -> 训练温度 ≤ {threshold:.1f}°C, 外推区间 {extrap_set['T_true'].min():.1f}°C ~ {extrap_set['T_true'].max():.1f}°C")
+    print(f"     训练样本 {len(train_ext)} 条，高温测试样本 {len(extrap_set)} 条。")
+
+    ridge_model = Pipeline([
+        ('scaler', StandardScaler()),
+        ('poly', PolynomialFeatures(degree=3, include_bias=False)),
+        ('reg', Ridge(alpha=1.0))
+    ])
+    ridge_model.fit(train_ext[['Ratio']], train_ext['T_true'])
+    pred_ridge = ridge_model.predict(extrap_set[['Ratio']])
+
+    params = best_params.copy()
+    params.update({'tree_method': 'hist', 'device': cfg.DEVICE, 'random_state': cfg.RANDOM_SEED + 2024})
+    xgb_model = xgb.XGBRegressor(**params)
+    xgb_model.fit(train_ext[best_feats], train_ext['T_true'])
+    pred_xgb = xgb_model.predict(extrap_set[best_feats])
+
+    def _report(name, y_true, y_pred):
+        rmse = np.sqrt(mean_squared_error(y_true, y_pred))
+        rmspe = np.sqrt(np.mean(((y_true - y_pred) / np.clip(y_true, cfg.NUMERIC_EPS, None))**2)) * 100
+        print(f"     {name:<12} RMSE = {rmse:6.3f}°C | RMSPE = {rmspe:5.2f}%")
+
+    _report("Ridge-Ratio", extrap_set['T_true'], pred_ridge)
+    _report("XGB-Optimal", extrap_set['T_true'], pred_xgb)
+
+def run_low_temp_focus(final_df, cfg):
+    print("\n>>> [Stage 8] 低温区间稳定性讨论...")
+    if final_df.empty:
+        print("  测试集为空，跳过。")
+        return
+    threshold = None
+    low_df = pd.DataFrame()
+    for q in (0.3, 0.4, 0.5):
+        threshold = final_df['T_true'].quantile(q)
+        low_df = final_df[final_df['T_true'] <= threshold]
+        if len(low_df) >= max(8, int(0.15 * len(final_df))):
+            break
+    if threshold is None or low_df.empty:
+        print("  低温样本不足。")
+        return
+    ratio_cv = low_df['Ratio'].std() / (np.abs(low_df['Ratio'].mean()) + cfg.NUMERIC_EPS)
+    print(f"  -> 阈值 ≤ {threshold:.1f}°C，占比 {len(low_df)/len(final_df)*100:.1f}%")
+    print(f"     低压均值: V1={low_df['V1'].mean():.3f}, V2={low_df['V2'].mean():.3f}, Ratio CV={ratio_cv:.2f}")
+    def _err(y_true, y_pred):
+        rmse = np.sqrt(mean_squared_error(y_true, y_pred))
+        rmspe = np.sqrt(np.mean(((y_true - y_pred)/np.clip(y_true, cfg.NUMERIC_EPS, None))**2)) * 100
+        return rmse, rmspe
+    r_rmse, r_rmspe = _err(low_df['T_true'], low_df['Pred_Ridge'])
+    x_rmse, x_rmspe = _err(low_df['T_true'], low_df['Pred_XGB'])
+    print(f"     Ridge-Ratio  RMSE={r_rmse:6.3f}°C | RMSPE={r_rmspe:5.2f}% (比值被放大)")
+    print(f"     XGB-Optimal  RMSE={x_rmse:6.3f}°C | RMSPE={x_rmspe:5.2f}% (多特征抑制噪声)")
+
 # ==============================================================================
 # 主程序
 # ==============================================================================
@@ -403,39 +505,42 @@ def main():
     fe = FeatureEngineer(cfg)
     train_df = fe.generate(train_df)
     test_df = fe.generate(test_df)
-    # [新] 使用筛选后的组合
     feature_combos = fe.filter_and_get_combinations(train_df)
     print(f"筛选后剩余 {len(feature_combos)} 种特征组合。")
     
-    # 3. 基准
+    # 3. 多项式回归 (论文基线)
+    poly_mgr = PolynomialRatioCalibrator()
+    poly_mgr.train(train_df)
+    poly_preds = poly_mgr.predict(test_df)
+    
+    # 4. 基准 (Ridge)
     bm = BaselineManager()
     bm.train(train_df, train_df['T_true'])
     base_preds = bm.predict(test_df)
     
-    # 4. XGBoost
+    # 5. XGBoost
     xgbo = XGBoostManager(cfg)
     best_params, best_feats = xgbo.optimize_main(train_df, feature_combos)
     main_model, xgb_mean, xgb_std = xgbo.train_ensemble(train_df, test_df)
     
-    # 5. 效率 (修复版)
+    # 6. 效率 (修复版)
     eff_df = run_efficiency_study(cfg, train_df, test_df, xgbo, best_feats)
     
-    # 6. 绘图与报告
+    # 7. 绘图与报告
     print("\n>>> [Stage 6] 生成最终图表...")
     
     y_test = test_df['T_true']
     final_df = test_df.copy()
+    final_df['Pred_Poly'] = poly_preds
     final_df['Pred_Ridge'] = base_preds
     final_df['Pred_XGB'] = xgb_mean
     final_df['Residual_XGB'] = final_df['Pred_XGB'] - final_df['T_true']
     
-    # [修复 Figure 1]
     plt.figure(figsize=(12, 7))
     sort_idx = np.argsort(y_test)
     y_sorted = y_test.iloc[sort_idx]
-    
     plt.plot([y_sorted.min(), y_sorted.max()], [y_sorted.min(), y_sorted.max()], 'k--', lw=1, label='Ideal')
-    # 使用排序后的数据绘制平滑曲线
+    plt.plot(y_sorted, final_df['Pred_Poly'].iloc[sort_idx], c='tab:green', lw=1.5, label='Poly-Ratio (deg3)')
     plt.plot(y_sorted, final_df['Pred_Ridge'].iloc[sort_idx], c='tab:orange', lw=1.5, label='Ridge-Ratio')
     plt.plot(y_sorted, final_df['Pred_XGB'].iloc[sort_idx], c='red', lw=2.5, label='XGB-Optimal')
     plt.fill_between(y_sorted,
@@ -487,11 +592,22 @@ def main():
     shap.summary_plot(shap_values, X_shap, show=False)
     plt.savefig(f"{cfg.OUTPUT_DIR}/Figure5_SHAP.png", bbox_inches='tight')
 
-    rmse = np.sqrt(mean_squared_error(y_test, xgb_mean))
+    run_extrapolation_test(train_df, test_df, best_params, best_feats, cfg)
+    run_low_temp_focus(final_df, cfg)
+
+    poly_rmse = np.sqrt(mean_squared_error(y_test, final_df['Pred_Poly']))
+    poly_r2 = r2_score(y_test, final_df['Pred_Poly'])
+    ridge_rmse = np.sqrt(mean_squared_error(y_test, final_df['Pred_Ridge']))
+    ridge_r2 = r2_score(y_test, final_df['Pred_Ridge'])
+    xgb_rmse = np.sqrt(mean_squared_error(y_test, xgb_mean))
     r2 = r2_score(y_test, xgb_mean)
-    print(f"\n>>> 最终测试集指标: RMSE = {rmse:.4f} °C, R2 = {r2:.5f}")
+    print("\n>>> 最终测试集指标:")
+    print(f"     Poly-Ratio   RMSE = {poly_rmse:.4f} °C, R2 = {poly_r2:.5f}")
+    print(f"     Ridge-Ratio  RMSE = {ridge_rmse:.4f} °C, R2 = {ridge_r2:.5f}")
+    print(f"     XGB-Optimal  RMSE = {xgb_rmse:.4f} °C, R2 = {r2:.5f}")
     
-    # 保存报告
+    final_df['Err_Poly'] = np.abs((y_test - final_df['Pred_Poly']) / y_test) * 100
+    final_df['Err_Ridge'] = np.abs((y_test - final_df['Pred_Ridge']) / y_test) * 100
     final_df['Err_XGB'] = np.abs((y_test - final_df['Pred_XGB']) / y_test) * 100
     final_df.to_csv(f"{cfg.OUTPUT_DIR}/final_predictions.csv", index=False)
     hist_df.to_csv(f"{cfg.OUTPUT_DIR}/optimization_history.csv", index=False)
