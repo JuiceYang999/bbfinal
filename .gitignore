@@ -1,0 +1,40 @@
+# 1. 忽略 Python 缓存和环境
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.ipynb_checkpoints/
+
+
+
+# 3. (最重要) 忽略模型和结果
+# ------------------------------------
+# 忽略所有模型文件
+*.pth
+*.pt
+*.h5
+*.onnx
+*.ckpt
+*.tflite
+*.pb
+
+# 忽略所有日志和结果文件夹
+# (请根据您的实际文件夹名称修改)
+logs/
+experiments/results/
+outputs/
+models/
+saved_models/
+raw-data/
+
+# 4. 忽略大型数据文件
+# (如果您有不想上传的 .csv 或 .pkl)
+*.csv
+*.pkl
+*.data
+*.npy
+
+# 5. 忽略 VSCode 和系统文件
+.vscode/
+.idea/
+*.DS_Store
